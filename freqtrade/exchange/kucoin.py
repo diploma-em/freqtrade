@@ -23,8 +23,7 @@ class Kucoin(Exchange):
         "stoploss_order_types": {"limit": "limit", "market": "market"},
         "l2_limit_range": [20, 100],
         "l2_limit_range_required": False,
-        "order_time_in_force": ['gtc', 'fok', 'ioc'],
-        "time_in_force_parameter": "timeInForce",
+        "order_time_in_force": ['GTC', 'FOK', 'IOC'],
         "ohlcv_candle_limit": 1500,
     }
 
@@ -33,7 +32,10 @@ class Kucoin(Exchange):
         Verify stop_loss against stoploss-order value (limit or price)
         Returns True if adjustment is necessary.
         """
-        return order['info'].get('stop') is not None and stop_loss > float(order['stopPrice'])
+        return (
+            order.get('stopPrice', None) is None
+            or stop_loss > float(order['stopPrice'])
+        )
 
     def _get_stop_params(self, ordertype: str, stop_price: float) -> Dict:
 

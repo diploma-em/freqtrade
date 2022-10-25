@@ -68,6 +68,36 @@ def test_method_to_test(caplog):
 
 ```
 
+### Debug configuration
+
+To debug freqtrade, we recommend VSCode with the following launch configuration (located in `.vscode/launch.json`).
+Details will obviously vary between setups - but this should work to get you started.
+
+``` json
+{
+    "name": "freqtrade trade",
+    "type": "python",
+    "request": "launch",
+    "module": "freqtrade",
+    "console": "integratedTerminal",
+    "args": [
+        "trade",
+        // Optional:
+        // "--userdir", "user_data",
+        "--strategy", 
+        "MyAwesomeStrategy",
+    ]
+},
+```
+
+Command line arguments can be added in the `"args"` array.
+This method can also be used to debug a strategy, by setting the breakpoints within the strategy.
+
+A similar setup can also be taken for Pycharm - using `freqtrade` as module name, and setting the command line arguments as "parameters".
+
+!!! Note "Startup directory"
+    This assumes that you have the repository checked out, and the editor is started at the repository root level (so setup.py is at the top level of your repository).
+
 ## ErrorHandling
 
 Freqtrade Exceptions all inherit from `FreqtradeException`.
@@ -314,6 +344,32 @@ The output will show the last entry from the Exchange as well as the current UTC
 If the day shows the same day, then the last candle can be assumed as incomplete and should be dropped (leave the setting `"ohlcv_partial_candle"` from the exchange-class untouched / True). Otherwise, set `"ohlcv_partial_candle"` to `False` to not drop Candles (shown in the example above).
 Another way is to run this command multiple times in a row and observe if the volume is changing (while the date remains the same).
 
+### Update binance cached leverage tiers
+
+Updating leveraged tiers should be done regularly - and requires an authenticated account with futures enabled.
+
+``` python
+import ccxt
+import json
+from pathlib import Path
+
+exchange = ccxt.binance({
+    'apiKey': '<apikey>',
+    'secret': '<secret>'
+    'options': {'defaultType': 'future'}
+    })
+_ = exchange.load_markets()
+
+lev_tiers = exchange.fetch_leverage_tiers()
+
+# Assumes this is running in the root of the repository.
+file = Path('freqtrade/exchange/binance_leverage_tiers.json')
+json.dump(dict(sorted(lev_tiers.items())), file.open('w'), indent=2)
+
+```
+
+This file should then be contributed upstream, so others can benefit from this, too.
+
 ## Updating example notebooks
 
 To keep the jupyter notebooks aligned with the documentation, the following should be ran after updating a example notebook.
@@ -353,8 +409,9 @@ Determine if crucial bugfixes have been made between this commit and the current
 
 * Merge the release branch (stable) into this branch.
 * Edit `freqtrade/__init__.py` and add the version matching the current date (for example `2019.7` for July 2019). Minor versions can be `2019.7.1` should we need to do a second release that month. Version numbers must follow allowed versions from PEP0440 to avoid failures pushing to pypi.
-* Commit this part
-* push that branch to the remote and create a PR against the stable branch
+* Commit this part.
+* push that branch to the remote and create a PR against the stable branch.
+* Update develop version to next version following the pattern `2019.8-dev`.
 
 ### Create changelog from git commits
 

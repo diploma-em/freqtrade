@@ -1,9 +1,10 @@
 """ FTX exchange subclass """
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
 
+from freqtrade.constants import BuySell
 from freqtrade.enums import MarginMode, TradingMode
 from freqtrade.exceptions import (DDosProtection, InsufficientFundsError, InvalidOrderException,
                                   OperationalException, TemporaryError)
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 class Ftx(Exchange):
 
     _ft_has: Dict = {
+        "order_time_in_force": ['GTC', 'IOC', 'PO'],
         "stoploss_on_exchange": True,
         "ohlcv_candle_limit": 1500,
         "ohlcv_require_since": True,
@@ -44,7 +46,7 @@ class Ftx(Exchange):
 
     @retrier(retries=0)
     def stoploss(self, pair: str, amount: float, stop_price: float,
-                 order_types: Dict, side: str, leverage: float) -> Dict:
+                 order_types: Dict, side: BuySell, leverage: float) -> Dict:
         """
         Creates a stoploss order.
         depending on order_types.stoploss configuration, uses 'market' or limit order.
@@ -103,7 +105,7 @@ class Ftx(Exchange):
             raise OperationalException(e) from e
 
     @retrier(retries=API_FETCH_ORDER_RETRY_COUNT)
-    def fetch_stoploss_order(self, order_id: str, pair: str) -> Dict:
+    def fetch_stoploss_order(self, order_id: str, pair: str, params: Dict = {}) -> Dict:
         if self._config['dry_run']:
             return self.fetch_dry_run_order(order_id)
 
@@ -115,9 +117,17 @@ class Ftx(Exchange):
             if len(order) == 1:
                 if order[0].get('status') == 'closed':
                     # Trigger order was triggered ...
-                    real_order_id = order[0].get('info', {}).get('orderId')
+                    real_order_id: Optional[str] = order[0].get('info', {}).get('orderId')
                     # OrderId may be None for stoploss-market orders
-                    # But contains "average" in these cases.
+                    # So we need to get it through the endpoint
+                    # /conditional_orders/{conditional_order_id}/triggers
+                    if not real_order_id:
+                        res = self._api.privateGetConditionalOrdersConditionalOrderIdTriggers(
+                            params={'conditional_order_id': order_id})
+                        self._log_exchange_response('fetch_stoploss_order2', res)
+                        real_order_id = res['result'][0]['orderId'] if res.get(
+                            'result', []) else None
+
                     if real_order_id:
                         order1 = self._api.fetch_order(real_order_id, pair)
                         self._log_exchange_response('fetch_stoploss_order1', order1)
@@ -144,7 +154,7 @@ class Ftx(Exchange):
             raise OperationalException(e) from e
 
     @retrier
-    def cancel_stoploss_order(self, order_id: str, pair: str) -> Dict:
+    def cancel_stoploss_order(self, order_id: str, pair: str, params: Dict = {}) -> Dict:
         if self._config['dry_run']:
             return {}
         try:

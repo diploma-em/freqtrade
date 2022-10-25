@@ -17,6 +17,7 @@ from typing import Any, Dict
 
 from pandas import DataFrame
 
+from freqtrade.constants import Config
 from freqtrade.optimize.hyperopt import IHyperOptLoss
 
 TARGET_TRADES = 600
@@ -31,7 +32,7 @@ class SuperDuperHyperOptLoss(IHyperOptLoss):
     @staticmethod
     def hyperopt_loss_function(results: DataFrame, trade_count: int,
                                min_date: datetime, max_date: datetime,
-                               config: Dict, processed: Dict[str, DataFrame],
+                               config: Config, processed: Dict[str, DataFrame],
                                backtest_stats: Dict[str, Any],
                                *args, **kwargs) -> float:
         """
@@ -97,6 +98,23 @@ class MyAwesomeStrategy(IStrategy):
 
 !!! Note
     All overrides are optional and can be mixed/matched as necessary.
+
+### Dynamic parameters
+
+Parameters can also be defined dynamically, but must be available to the instance once the * [`bot_start()` callback](strategy-callbacks.md#bot-start) has been called.
+
+``` python
+
+class MyAwesomeStrategy(IStrategy):
+
+    def bot_start(self, **kwargs) -> None:
+        self.buy_adx = IntParameter(20, 30, default=30, optimize=True)
+
+    # ...
+```
+
+!!! Warning
+    Parameters created this way will not show up in the `list-strategies` parameter count.
 
 ### Overriding Base estimator
 

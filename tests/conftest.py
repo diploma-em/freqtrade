@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, Mock, PropertyMock
 
 import arrow
 import numpy as np
+import pandas as pd
 import pytest
 from telegram import Chat, Message, Update
 
@@ -19,6 +20,7 @@ from freqtrade.data.converter import ohlcv_to_dataframe
 from freqtrade.edge import PairInfo
 from freqtrade.enums import CandleType, MarginMode, RunMode, SignalDirection, TradingMode
 from freqtrade.exchange import Exchange
+from freqtrade.exchange.exchange import timeframe_to_minutes
 from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.persistence import LocalTrade, Order, Trade, init_db
 from freqtrade.resolvers import ExchangeResolver
@@ -58,6 +60,11 @@ def log_has(line, logs):
     return any(line == message for message in logs.messages)
 
 
+def log_has_when(line, logs, when):
+    """Check if line is found in caplog's messages during a specified stage"""
+    return any(line == message.message for message in logs.get_records(when))
+
+
 def log_has_re(line, logs):
     """Check if line matches some caplog's message."""
     return any(re.match(line, message) for message in logs.messages)
@@ -77,10 +84,49 @@ def get_args(args):
     return Arguments(args).get_parsed_arg()
 
 
+def generate_test_data(timeframe: str, size: int, start: str = '2020-07-05'):
+    np.random.seed(42)
+    tf_mins = timeframe_to_minutes(timeframe)
+
+    base = np.random.normal(20, 2, size=size)
+
+    date = pd.date_range(start, periods=size, freq=f'{tf_mins}min', tz='UTC')
+    df = pd.DataFrame({
+        'date': date,
+        'open': base,
+        'high': base + np.random.normal(2, 1, size=size),
+        'low': base - np.random.normal(2, 1, size=size),
+        'close': base + np.random.normal(0, 1, size=size),
+        'volume': np.random.normal(200, size=size)
+    }
+    )
+    df = df.dropna()
+    return df
+
+
+def generate_test_data_raw(timeframe: str, size: int, start: str = '2020-07-05'):
+    """ Generates data in the ohlcv format used by ccxt """
+    df = generate_test_data(timeframe, size, start)
+    df['date'] = df.loc[:, 'date'].view(np.int64) // 1000 // 1000
+    return list(list(x) for x in zip(*(df[x].values.tolist() for x in df.columns)))
+
+
 # Source: https://stackoverflow.com/questions/29881236/how-to-mock-asyncio-coroutines
-def get_mock_coro(return_value):
+# TODO: This should be replaced with AsyncMock once support for python 3.7 is dropped.
+def get_mock_coro(return_value=None, side_effect=None):
     async def mock_coro(*args, **kwargs):
-        return return_value
+        if side_effect:
+            if isinstance(side_effect, list):
+                effect = side_effect.pop(0)
+            else:
+                effect = side_effect
+            if isinstance(effect, Exception):
+                raise effect
+            if callable(effect):
+                return effect(*args, **kwargs)
+            return effect
+        else:
+            return return_value
 
     return Mock(wraps=mock_coro)
 
@@ -100,11 +146,8 @@ def patch_exchange(
     mock_supported_modes=True
 ) -> None:
     mocker.patch('freqtrade.exchange.Exchange._load_async_markets', MagicMock(return_value={}))
-    mocker.patch('freqtrade.exchange.Exchange.validate_pairs', MagicMock())
+    mocker.patch('freqtrade.exchange.Exchange.validate_config', MagicMock())
     mocker.patch('freqtrade.exchange.Exchange.validate_timeframes', MagicMock())
-    mocker.patch('freqtrade.exchange.Exchange.validate_ordertypes', MagicMock())
-    mocker.patch('freqtrade.exchange.Exchange.validate_stakecurrency', MagicMock())
-    mocker.patch('freqtrade.exchange.Exchange.validate_pricing')
     mocker.patch('freqtrade.exchange.Exchange.id', PropertyMock(return_value=id))
     mocker.patch('freqtrade.exchange.Exchange.name', PropertyMock(return_value=id.title()))
     mocker.patch('freqtrade.exchange.Exchange.precisionMode', PropertyMock(return_value=2))
@@ -139,7 +182,7 @@ def get_patched_exchange(mocker, config, api_mock=None, id='binance',
     patch_exchange(mocker, api_mock, id, mock_markets, mock_supported_modes)
     config['exchange']['name'] = id
     try:
-        exchange = ExchangeResolver.load_exchange(id, config)
+        exchange = ExchangeResolver.load_exchange(id, config, load_leverage_tiers=True)
     except ImportError:
         exchange = Exchange(config)
     return exchange
@@ -186,6 +229,8 @@ def patch_freqtradebot(mocker, config) -> None:
     mocker.patch('freqtrade.freqtradebot.RPCManager._init', MagicMock())
     mocker.patch('freqtrade.freqtradebot.RPCManager.send_msg', MagicMock())
     patch_whitelist(mocker, config)
+    mocker.patch('freqtrade.freqtradebot.ExternalMessageConsumer')
+    mocker.patch('freqtrade.configuration.config_validation._validate_consumers')
 
 
 def get_patched_freqtradebot(mocker, config) -> FreqtradeBot:
@@ -325,7 +370,7 @@ def create_mock_trades_with_leverage(fee, use_db: bool = True):
         Trade.query.session.flush()
 
 
-def create_mock_trades_usdt(fee, use_db: bool = True):
+def create_mock_trades_usdt(fee, is_short: Optional[bool] = False, use_db: bool = True):
     """
     Create some fake trades ...
     """
@@ -335,26 +380,29 @@ def create_mock_trades_usdt(fee, use_db: bool = True):
         else:
             LocalTrade.add_bt_trade(trade)
 
+    is_short1 = is_short if is_short is not None else True
+    is_short2 = is_short if is_short is not None else False
+
     # Simulate dry_run entries
-    trade = mock_trade_usdt_1(fee)
+    trade = mock_trade_usdt_1(fee, is_short1)
     add_trade(trade)
 
-    trade = mock_trade_usdt_2(fee)
+    trade = mock_trade_usdt_2(fee, is_short1)
     add_trade(trade)
 
-    trade = mock_trade_usdt_3(fee)
+    trade = mock_trade_usdt_3(fee, is_short1)
     add_trade(trade)
 
-    trade = mock_trade_usdt_4(fee)
+    trade = mock_trade_usdt_4(fee, is_short2)
     add_trade(trade)
 
-    trade = mock_trade_usdt_5(fee)
+    trade = mock_trade_usdt_5(fee, is_short2)
     add_trade(trade)
 
-    trade = mock_trade_usdt_6(fee)
+    trade = mock_trade_usdt_6(fee, is_short1)
     add_trade(trade)
 
-    trade = mock_trade_usdt_7(fee)
+    trade = mock_trade_usdt_7(fee, is_short1)
     add_trade(trade)
     if use_db:
         Trade.commit()
@@ -384,7 +432,7 @@ def patch_coingekko(mocker) -> None:
 
 @pytest.fixture(scope='function')
 def init_persistence(default_conf):
-    init_db(default_conf['db_url'], default_conf['dry_run'])
+    init_db(default_conf['db_url'])
 
 
 @pytest.fixture(scope="function")
@@ -1615,6 +1663,7 @@ def limit_buy_order_open():
         'timestamp': arrow.utcnow().int_timestamp * 1000,
         'datetime': arrow.utcnow().isoformat(),
         'price': 0.00001099,
+        'average': 0.00001099,
         'amount': 90.99181073,
         'filled': 0.0,
         'cost': 0.0009999,
@@ -1678,6 +1727,7 @@ def limit_buy_order_old_partial():
         'price': 0.00001099,
         'amount': 90.99181073,
         'filled': 23.0,
+        'cost': 90.99181073 * 23.0,
         'remaining': 67.99181073,
         'status': 'open'
     }
@@ -2268,7 +2318,7 @@ def tickers():
 
 
 @pytest.fixture
-def result(testdatadir):
+def dataframe_1m(testdatadir):
     with (testdatadir / 'UNITTEST_BTC-1m.json').open('r') as data_file:
         return ohlcv_to_dataframe(json.load(data_file), '1m', pair="UNITTEST/BTC",
                                   fill_missing=True)
@@ -2595,7 +2645,7 @@ def open_trade_usdt():
         pair='ADA/USDT',
         open_rate=2.0,
         exchange='binance',
-        open_order_id='123456789',
+        open_order_id='123456789_exit',
         amount=30.0,
         fee_open=0.0,
         fee_close=0.0,
@@ -2613,6 +2663,23 @@ def open_trade_usdt():
             symbol=trade.pair,
             order_type="market",
             side="buy",
+            price=trade.open_rate,
+            average=trade.open_rate,
+            filled=trade.amount,
+            remaining=0,
+            cost=trade.open_rate * trade.amount,
+            order_date=trade.open_date,
+            order_filled_date=trade.open_date,
+        ),
+        Order(
+            ft_order_side='exit',
+            ft_pair=trade.pair,
+            ft_is_open=True,
+            order_id='123456789_exit',
+            status="open",
+            symbol=trade.pair,
+            order_type="limit",
+            side="sell",
             price=trade.open_rate,
             average=trade.open_rate,
             filled=trade.amount,
@@ -2786,6 +2853,7 @@ def limit_buy_order_usdt_open():
         'datetime': arrow.utcnow().isoformat(),
         'timestamp': arrow.utcnow().int_timestamp * 1000,
         'price': 2.00,
+        'average': 2.00,
         'amount': 30.0,
         'filled': 0.0,
         'cost': 60.0,
@@ -3053,430 +3121,416 @@ def leverage_tiers():
     return {
         "1000SHIB/USDT": [
             {
-                'min': 0,
-                'max': 50000,
-                'mmr': 0.01,
-                'lev': 50,
+                'minNotional': 0,
+                'maxNotional': 50000,
+                'maintenanceMarginRate': 0.01,
+                'maxLeverage': 50,
                 'maintAmt': 0.0
             },
             {
-                'min': 50000,
-                'max': 150000,
-                'mmr': 0.025,
-                'lev': 20,
+                'minNotional': 50000,
+                'maxNotional': 150000,
+                'maintenanceMarginRate': 0.025,
+                'maxLeverage': 20,
                 'maintAmt': 750.0
             },
             {
-                'min': 150000,
-                'max': 250000,
-                'mmr': 0.05,
-                'lev': 10,
+                'minNotional': 150000,
+                'maxNotional': 250000,
+                'maintenanceMarginRate': 0.05,
+                'maxLeverage': 10,
                 'maintAmt': 4500.0
             },
             {
-                'min': 250000,
-                'max': 500000,
-                'mmr': 0.1,
-                'lev': 5,
+                'minNotional': 250000,
+                'maxNotional': 500000,
+                'maintenanceMarginRate': 0.1,
+                'maxLeverage': 5,
                 'maintAmt': 17000.0
             },
             {
-                'min': 500000,
-                'max': 1000000,
-                'mmr': 0.125,
-                'lev': 4,
+                'minNotional': 500000,
+                'maxNotional': 1000000,
+                'maintenanceMarginRate': 0.125,
+                'maxLeverage': 4,
                 'maintAmt': 29500.0
             },
             {
-                'min': 1000000,
-                'max': 2000000,
-                'mmr': 0.25,
-                'lev': 2,
+                'minNotional': 1000000,
+                'maxNotional': 2000000,
+                'maintenanceMarginRate': 0.25,
+                'maxLeverage': 2,
                 'maintAmt': 154500.0
             },
             {
-                'min': 2000000,
-                'max': 30000000,
-                'mmr': 0.5,
-                'lev': 1,
+                'minNotional': 2000000,
+                'maxNotional': 30000000,
+                'maintenanceMarginRate': 0.5,
+                'maxLeverage': 1,
                 'maintAmt': 654500.0
             },
         ],
         "1INCH/USDT": [
             {
-                'min': 0,
-                'max': 5000,
-                'mmr': 0.012,
-                'lev': 50,
+                'minNotional': 0,
+                'maxNotional': 5000,
+                'maintenanceMarginRate': 0.012,
+                'maxLeverage': 50,
                 'maintAmt': 0.0
             },
             {
-                'min': 5000,
-                'max': 25000,
-                'mmr': 0.025,
-                'lev': 20,
+                'minNotional': 5000,
+                'maxNotional': 25000,
+                'maintenanceMarginRate': 0.025,
+                'maxLeverage': 20,
                 'maintAmt': 65.0
             },
             {
-                'min': 25000,
-                'max': 100000,
-                'mmr': 0.05,
-                'lev': 10,
+                'minNotional': 25000,
+                'maxNotional': 100000,
+                'maintenanceMarginRate': 0.05,
+                'maxLeverage': 10,
                 'maintAmt': 690.0
             },
             {
-                'min': 100000,
-                'max': 250000,
-                'mmr': 0.1,
-                'lev': 5,
+                'minNotional': 100000,
+                'maxNotional': 250000,
+                'maintenanceMarginRate': 0.1,
+                'maxLeverage': 5,
                 'maintAmt': 5690.0
             },
             {
-                'min': 250000,
-                'max': 1000000,
-                'mmr': 0.125,
-                'lev': 2,
+                'minNotional': 250000,
+                'maxNotional': 1000000,
+                'maintenanceMarginRate': 0.125,
+                'maxLeverage': 2,
                 'maintAmt': 11940.0
             },
             {
-                'min': 1000000,
-                'max': 100000000,
-                'mmr': 0.5,
-                'lev': 1,
+                'minNotional': 1000000,
+                'maxNotional': 100000000,
+                'maintenanceMarginRate': 0.5,
+                'maxLeverage': 1,
                 'maintAmt': 386940.0
             },
         ],
         "AAVE/USDT": [
             {
-                'min': 0,
-                'max': 50000,
-                'mmr': 0.01,
-                'lev': 50,
+                'minNotional': 0,
+                'maxNotional': 5000,
+                'maintenanceMarginRate': 0.01,
+                'maxLeverage': 50,
                 'maintAmt': 0.0
             },
             {
-                'min': 50000,
-                'max': 250000,
-                'mmr': 0.02,
-                'lev': 25,
-                'maintAmt': 500.0
+                'minNotional': 5000,
+                'maxNotional': 25000,
+                'maintenanceMarginRate': 0.02,
+                'maxLeverage': 25,
+                'maintAmt': 75.0
             },
             {
-                'min': 250000,
-                'max': 1000000,
-                'mmr': 0.05,
-                'lev': 10,
-                'maintAmt': 8000.0
+                'minNotional': 25000,
+                'maxNotional': 100000,
+                'maintenanceMarginRate': 0.05,
+                'maxLeverage': 10,
+                'maintAmt': 700.0
             },
             {
-                'min': 1000000,
-                'max': 2000000,
-                'mmr': 0.1,
-                'lev': 5,
-                'maintAmt': 58000.0
+                'minNotional': 100000,
+                'maxNotional': 250000,
+                'maintenanceMarginRate': 0.1,
+                'maxLeverage': 5,
+                'maintAmt': 5700.0
             },
             {
-                'min': 2000000,
-                'max': 5000000,
-                'mmr': 0.125,
-                'lev': 4,
-                'maintAmt': 108000.0
+                'minNotional': 250000,
+                'maxNotional': 1000000,
+                'maintenanceMarginRate': 0.125,
+                'maxLeverage': 2,
+                'maintAmt': 11950.0
             },
             {
-                'min': 5000000,
-                'max': 10000000,
-                'mmr': 0.1665,
-                'lev': 3,
-                'maintAmt': 315500.0
+                'minNotional': 10000000,
+                'maxNotional': 50000000,
+                'maintenanceMarginRate': 0.5,
+                'maxLeverage': 1,
+                'maintAmt': 386950.0
             },
-            {
-                'min': 10000000,
-                'max': 20000000,
-                'mmr': 0.25,
-                'lev': 2,
-                'maintAmt': 1150500.0
-            },
-            {
-                "min": 20000000,
-                "max": 50000000,
-                "mmr": 0.5,
-                "lev": 1,
-                "maintAmt": 6150500.0
-            }
         ],
         "ADA/BUSD": [
             {
-                "min": 0,
-                "max": 100000,
-                "mmr": 0.025,
-                "lev": 20,
+                "minNotional": 0,
+                "maxNotional": 100000,
+                "maintenanceMarginRate": 0.025,
+                "maxLeverage": 20,
                 "maintAmt": 0.0
             },
             {
-                "min": 100000,
-                "max": 500000,
-                "mmr": 0.05,
-                "lev": 10,
+                "minNotional": 100000,
+                "maxNotional": 500000,
+                "maintenanceMarginRate": 0.05,
+                "maxLeverage": 10,
                 "maintAmt": 2500.0
             },
             {
-                "min": 500000,
-                "max": 1000000,
-                "mmr": 0.1,
-                "lev": 5,
+                "minNotional": 500000,
+                "maxNotional": 1000000,
+                "maintenanceMarginRate": 0.1,
+                "maxLeverage": 5,
                 "maintAmt": 27500.0
             },
             {
-                "min": 1000000,
-                "max": 2000000,
-                "mmr": 0.15,
-                "lev": 3,
+                "minNotional": 1000000,
+                "maxNotional": 2000000,
+                "maintenanceMarginRate": 0.15,
+                "maxLeverage": 3,
                 "maintAmt": 77500.0
             },
             {
-                "min": 2000000,
-                "max": 5000000,
-                "mmr": 0.25,
-                "lev": 2,
+                "minNotional": 2000000,
+                "maxNotional": 5000000,
+                "maintenanceMarginRate": 0.25,
+                "maxLeverage": 2,
                 "maintAmt": 277500.0
             },
             {
-                "min": 5000000,
-                "max": 30000000,
-                "mmr": 0.5,
-                "lev": 1,
+                "minNotional": 5000000,
+                "maxNotional": 30000000,
+                "maintenanceMarginRate": 0.5,
+                "maxLeverage": 1,
                 "maintAmt": 1527500.0
             },
         ],
         'BNB/BUSD': [
             {
-                "min": 0,       # stake(before leverage) = 0
-                "max": 100000,  # max stake(before leverage) = 5000
-                "mmr": 0.025,
-                "lev": 20,
+                "minNotional": 0,       # stake(before leverage) = 0
+                "maxNotional": 100000,  # max stake(before leverage) = 5000
+                "maintenanceMarginRate": 0.025,
+                "maxLeverage": 20,
                 "maintAmt": 0.0
             },
             {
-                "min": 100000,  # stake = 10000.0
-                "max": 500000,  # max_stake = 50000.0
-                "mmr": 0.05,
-                "lev": 10,
+                "minNotional": 100000,  # stake = 10000.0
+                "maxNotional": 500000,  # max_stake = 50000.0
+                "maintenanceMarginRate": 0.05,
+                "maxLeverage": 10,
                 "maintAmt": 2500.0
             },
             {
-                "min": 500000,   # stake = 100000.0
-                "max": 1000000,  # max_stake = 200000.0
-                "mmr": 0.1,
-                "lev": 5,
+                "minNotional": 500000,   # stake = 100000.0
+                "maxNotional": 1000000,  # max_stake = 200000.0
+                "maintenanceMarginRate": 0.1,
+                "maxLeverage": 5,
                 "maintAmt": 27500.0
             },
             {
-                "min": 1000000,  # stake = 333333.3333333333
-                "max": 2000000,  # max_stake = 666666.6666666666
-                "mmr": 0.15,
-                "lev": 3,
+                "minNotional": 1000000,  # stake = 333333.3333333333
+                "maxNotional": 2000000,  # max_stake = 666666.6666666666
+                "maintenanceMarginRate": 0.15,
+                "maxLeverage": 3,
                 "maintAmt": 77500.0
             },
             {
-                "min": 2000000,  # stake = 1000000.0
-                "max": 5000000,  # max_stake = 2500000.0
-                "mmr": 0.25,
-                "lev": 2,
+                "minNotional": 2000000,  # stake = 1000000.0
+                "maxNotional": 5000000,  # max_stake = 2500000.0
+                "maintenanceMarginRate": 0.25,
+                "maxLeverage": 2,
                 "maintAmt": 277500.0
             },
             {
-                "min": 5000000,   # stake = 5000000.0
-                "max": 30000000,  # max_stake = 30000000.0
-                "mmr": 0.5,
-                "lev": 1,
+                "minNotional": 5000000,   # stake = 5000000.0
+                "maxNotional": 30000000,  # max_stake = 30000000.0
+                "maintenanceMarginRate": 0.5,
+                "maxLeverage": 1,
                 "maintAmt": 1527500.0
             }
         ],
         'BNB/USDT': [
             {
-                "min": 0,      # stake = 0.0
-                "max": 10000,  # max_stake = 133.33333333333334
-                "mmr": 0.0065,
-                "lev": 75,
+                "minNotional": 0,      # stake = 0.0
+                "maxNotional": 10000,  # max_stake = 133.33333333333334
+                "maintenanceMarginRate": 0.0065,
+                "maxLeverage": 75,
                 "maintAmt": 0.0
             },
             {
-                "min": 10000,  # stake = 200.0
-                "max": 50000,  # max_stake = 1000.0
-                "mmr": 0.01,
-                "lev": 50,
+                "minNotional": 10000,  # stake = 200.0
+                "maxNotional": 50000,  # max_stake = 1000.0
+                "maintenanceMarginRate": 0.01,
+                "maxLeverage": 50,
                 "maintAmt": 35.0
             },
             {
-                "min": 50000,   # stake = 2000.0
-                "max": 250000,  # max_stake = 10000.0
-                "mmr": 0.02,
-                "lev": 25,
+                "minNotional": 50000,   # stake = 2000.0
+                "maxNotional": 250000,  # max_stake = 10000.0
+                "maintenanceMarginRate": 0.02,
+                "maxLeverage": 25,
                 "maintAmt": 535.0
             },
             {
-                "min": 250000,   # stake = 25000.0
-                "max": 1000000,  # max_stake = 100000.0
-                "mmr": 0.05,
-                "lev": 10,
+                "minNotional": 250000,   # stake = 25000.0
+                "maxNotional": 1000000,  # max_stake = 100000.0
+                "maintenanceMarginRate": 0.05,
+                "maxLeverage": 10,
                 "maintAmt": 8035.0
             },
             {
-                "min": 1000000,  # stake = 200000.0
-                "max": 2000000,  # max_stake = 400000.0
-                "mmr": 0.1,
-                "lev": 5,
+                "minNotional": 1000000,  # stake = 200000.0
+                "maxNotional": 2000000,  # max_stake = 400000.0
+                "maintenanceMarginRate": 0.1,
+                "maxLeverage": 5,
                 "maintAmt": 58035.0
             },
             {
-                "min": 2000000,  # stake = 500000.0
-                "max": 5000000,  # max_stake = 1250000.0
-                "mmr": 0.125,
-                "lev": 4,
+                "minNotional": 2000000,  # stake = 500000.0
+                "maxNotional": 5000000,  # max_stake = 1250000.0
+                "maintenanceMarginRate": 0.125,
+                "maxLeverage": 4,
                 "maintAmt": 108035.0
             },
             {
-                "min": 5000000,   # stake = 1666666.6666666667
-                "max": 10000000,  # max_stake = 3333333.3333333335
-                "mmr": 0.15,
-                "lev": 3,
+                "minNotional": 5000000,   # stake = 1666666.6666666667
+                "maxNotional": 10000000,  # max_stake = 3333333.3333333335
+                "maintenanceMarginRate": 0.15,
+                "maxLeverage": 3,
                 "maintAmt": 233035.0
             },
             {
-                "min": 10000000,  # stake = 5000000.0
-                "max": 20000000,  # max_stake = 10000000.0
-                "mmr": 0.25,
-                "lev": 2,
+                "minNotional": 10000000,  # stake = 5000000.0
+                "maxNotional": 20000000,  # max_stake = 10000000.0
+                "maintenanceMarginRate": 0.25,
+                "maxLeverage": 2,
                 "maintAmt": 1233035.0
             },
             {
-                "min": 20000000,  # stake = 20000000.0
-                "max": 50000000,  # max_stake = 50000000.0
-                "mmr": 0.5,
-                "lev": 1,
+                "minNotional": 20000000,  # stake = 20000000.0
+                "maxNotional": 50000000,  # max_stake = 50000000.0
+                "maintenanceMarginRate": 0.5,
+                "maxLeverage": 1,
                 "maintAmt": 6233035.0
             },
         ],
         'BTC/USDT': [
             {
-                "min": 0,      # stake = 0.0
-                "max": 50000,  # max_stake = 400.0
-                "mmr": 0.004,
-                "lev": 125,
+                "minNotional": 0,      # stake = 0.0
+                "maxNotional": 50000,  # max_stake = 400.0
+                "maintenanceMarginRate": 0.004,
+                "maxLeverage": 125,
                 "maintAmt": 0.0
             },
             {
-                "min": 50000,   # stake = 500.0
-                "max": 250000,  # max_stake = 2500.0
-                "mmr": 0.005,
-                "lev": 100,
+                "minNotional": 50000,   # stake = 500.0
+                "maxNotional": 250000,  # max_stake = 2500.0
+                "maintenanceMarginRate": 0.005,
+                "maxLeverage": 100,
                 "maintAmt": 50.0
             },
             {
-                "min": 250000,   # stake = 5000.0
-                "max": 1000000,  # max_stake = 20000.0
-                "mmr": 0.01,
-                "lev": 50,
+                "minNotional": 250000,   # stake = 5000.0
+                "maxNotional": 1000000,  # max_stake = 20000.0
+                "maintenanceMarginRate": 0.01,
+                "maxLeverage": 50,
                 "maintAmt": 1300.0
             },
             {
-                "min": 1000000,  # stake = 50000.0
-                "max": 7500000,  # max_stake = 375000.0
-                "mmr": 0.025,
-                "lev": 20,
+                "minNotional": 1000000,  # stake = 50000.0
+                "maxNotional": 7500000,  # max_stake = 375000.0
+                "maintenanceMarginRate": 0.025,
+                "maxLeverage": 20,
                 "maintAmt": 16300.0
             },
             {
-                "min": 7500000,   # stake = 750000.0
-                "max": 40000000,  # max_stake = 4000000.0
-                "mmr": 0.05,
-                "lev": 10,
+                "minNotional": 7500000,   # stake = 750000.0
+                "maxNotional": 40000000,  # max_stake = 4000000.0
+                "maintenanceMarginRate": 0.05,
+                "maxLeverage": 10,
                 "maintAmt": 203800.0
             },
             {
-                "min": 40000000,   # stake = 8000000.0
-                "max": 100000000,  # max_stake = 20000000.0
-                "mmr": 0.1,
-                "lev": 5,
+                "minNotional": 40000000,   # stake = 8000000.0
+                "maxNotional": 100000000,  # max_stake = 20000000.0
+                "maintenanceMarginRate": 0.1,
+                "maxLeverage": 5,
                 "maintAmt": 2203800.0
             },
             {
-                "min": 100000000,  # stake = 25000000.0
-                "max": 200000000,  # max_stake = 50000000.0
-                "mmr": 0.125,
-                "lev": 4,
+                "minNotional": 100000000,  # stake = 25000000.0
+                "maxNotional": 200000000,  # max_stake = 50000000.0
+                "maintenanceMarginRate": 0.125,
+                "maxLeverage": 4,
                 "maintAmt": 4703800.0
             },
             {
-                "min": 200000000,  # stake = 66666666.666666664
-                "max": 400000000,  # max_stake = 133333333.33333333
-                "mmr": 0.15,
-                "lev": 3,
+                "minNotional": 200000000,  # stake = 66666666.666666664
+                "maxNotional": 400000000,  # max_stake = 133333333.33333333
+                "maintenanceMarginRate": 0.15,
+                "maxLeverage": 3,
                 "maintAmt": 9703800.0
             },
             {
-                "min": 400000000,  # stake = 200000000.0
-                "max": 600000000,  # max_stake = 300000000.0
-                "mmr": 0.25,
-                "lev": 2,
+                "minNotional": 400000000,  # stake = 200000000.0
+                "maxNotional": 600000000,  # max_stake = 300000000.0
+                "maintenanceMarginRate": 0.25,
+                "maxLeverage": 2,
                 "maintAmt": 4.97038E7
             },
             {
-                "min": 600000000,   # stake = 600000000.0
-                "max": 1000000000,  # max_stake = 1000000000.0
-                "mmr": 0.5,
-                "lev": 1,
+                "minNotional": 600000000,   # stake = 600000000.0
+                "maxNotional": 1000000000,  # max_stake = 1000000000.0
+                "maintenanceMarginRate": 0.5,
+                "maxLeverage": 1,
                 "maintAmt": 1.997038E8
             },
         ],
         "ZEC/USDT": [
             {
-                'min': 0,
-                'max': 50000,
-                'mmr': 0.01,
-                'lev': 50,
+                'minNotional': 0,
+                'maxNotional': 50000,
+                'maintenanceMarginRate': 0.01,
+                'maxLeverage': 50,
                 'maintAmt': 0.0
             },
             {
-                'min': 50000,
-                'max': 150000,
-                'mmr': 0.025,
-                'lev': 20,
+                'minNotional': 50000,
+                'maxNotional': 150000,
+                'maintenanceMarginRate': 0.025,
+                'maxLeverage': 20,
                 'maintAmt': 750.0
             },
             {
-                'min': 150000,
-                'max': 250000,
-                'mmr': 0.05,
-                'lev': 10,
+                'minNotional': 150000,
+                'maxNotional': 250000,
+                'maintenanceMarginRate': 0.05,
+                'maxLeverage': 10,
                 'maintAmt': 4500.0
             },
             {
-                'min': 250000,
-                'max': 500000,
-                'mmr': 0.1,
-                'lev': 5,
+                'minNotional': 250000,
+                'maxNotional': 500000,
+                'maintenanceMarginRate': 0.1,
+                'maxLeverage': 5,
                 'maintAmt': 17000.0
             },
             {
-                'min': 500000,
-                'max': 1000000,
-                'mmr': 0.125,
-                'lev': 4,
+                'minNotional': 500000,
+                'maxNotional': 1000000,
+                'maintenanceMarginRate': 0.125,
+                'maxLeverage': 4,
                 'maintAmt': 29500.0
             },
             {
-                'min': 1000000,
-                'max': 2000000,
-                'mmr': 0.25,
-                'lev': 2,
+                'minNotional': 1000000,
+                'maxNotional': 2000000,
+                'maintenanceMarginRate': 0.25,
+                'maxLeverage': 2,
                 'maintAmt': 154500.0
             },
             {
-                'min': 2000000,
-                'max': 30000000,
-                'mmr': 0.5,
-                'lev': 1,
+                'minNotional': 2000000,
+                'maxNotional': 30000000,
+                'maintenanceMarginRate': 0.5,
+                'maxLeverage': 1,
                 'maintAmt': 654500.0
             },
         ]

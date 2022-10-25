@@ -25,7 +25,7 @@ function check_installed_python() {
         exit 2
     fi
 
-    for v in 9 10 8
+    for v in 10 9 8
     do
         PYTHON="python3.${v}"
         which $PYTHON
@@ -77,7 +77,15 @@ function updateenv() {
         fi
     fi
 
-    ${PYTHON} -m pip install --upgrade -r ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT}
+    REQUIREMENTS_FREQAI=""
+    read -p "Do you want to install dependencies for freqai [y/N]? "
+    dev=$REPLY
+    if [[ $REPLY =~ ^[Yy]$ ]]
+    then
+        REQUIREMENTS_FREQAI="-r requirements-freqai.txt"
+    fi
+
+    ${PYTHON} -m pip install --upgrade -r ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT} ${REQUIREMENTS_FREQAI}
     if [ $? -ne 0 ]; then
         echo "Failed installing dependencies"
         exit 1
@@ -87,6 +95,10 @@ function updateenv() {
         echo "Failed installing Freqtrade"
         exit 1
     fi
+
+    echo "Installing freqUI"
+    freqtrade install-ui
+
     echo "pip install completed"
     echo
     if [[ $dev =~ ^[Yy]$ ]]; then
