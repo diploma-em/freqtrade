@@ -706,6 +706,46 @@ def test_api_delete_trade(botclient, mocker, fee, markets, is_short):
     assert_response(rc, 502)
 
 
+@pytest.mark.parametrize('is_short', [True, False])
+def test_api_delete_open_order(botclient, mocker, fee, markets, ticker, is_short):
+    ftbot, client = botclient
+    patch_get_signal(ftbot, enter_long=not is_short, enter_short=is_short)
+    stoploss_mock = MagicMock()
+    cancel_mock = MagicMock()
+    mocker.patch.multiple(
+        'freqtrade.exchange.Exchange',
+        markets=PropertyMock(return_value=markets),
+        fetch_ticker=ticker,
+        cancel_order=cancel_mock,
+        cancel_stoploss_order=stoploss_mock,
+    )
+
+    rc = client_delete(client, f"{BASE_URI}/trades/10/open-order")
+    assert_response(rc, 502)
+    assert 'Invalid trade_id.' in rc.json()['error']
+
+    create_mock_trades(fee, is_short=is_short)
+    Trade.commit()
+
+    rc = client_delete(client, f"{BASE_URI}/trades/5/open-order")
+    assert_response(rc, 502)
+    assert 'No open order for trade_id' in rc.json()['error']
+    trade = Trade.get_trades([Trade.id == 6]).first()
+    mocker.patch('freqtrade.exchange.Exchange.fetch_order',
+                 side_effect=ExchangeError)
+    rc = client_delete(client, f"{BASE_URI}/trades/6/open-order")
+    assert_response(rc, 502)
+    assert 'Order not found.' in rc.json()['error']
+
+    trade = Trade.get_trades([Trade.id == 6]).first()
+    mocker.patch('freqtrade.exchange.Exchange.fetch_order',
+                 return_value=trade.orders[-1].to_ccxt_object())
+
+    rc = client_delete(client, f"{BASE_URI}/trades/6/open-order")
+    assert_response(rc)
+    assert cancel_mock.call_count == 1
+
+
 def test_api_logs(botclient):
     ftbot, client = botclient
     rc = client_get(client, f"{BASE_URI}/logs")
@@ -1417,7 +1457,7 @@ def test_api_pair_history(botclient, ohlcv_history):
                                   "No data for UNITTEST/BTC, 5m in 20200111-20200112 found.")
 
 
-def test_api_plot_config(botclient):
+def test_api_plot_config(botclient, mocker):
     ftbot, client = botclient
 
     rc = client_get(client, f"{BASE_URI}/plot_config")
@@ -1440,6 +1480,21 @@ def test_api_plot_config(botclient):
 
     assert isinstance(rc.json()['main_plot'], dict)
     assert isinstance(rc.json()['subplots'], dict)
+
+    rc = client_get(client, f"{BASE_URI}/plot_config?strategy=freqai_test_classifier")
+    assert_response(rc)
+    res = rc.json()
+    assert 'target_roi' in res['subplots']
+    assert 'do_predict' in res['subplots']
+
+    rc = client_get(client, f"{BASE_URI}/plot_config?strategy=HyperoptableStrategy")
+    assert_response(rc)
+    assert rc.json()['subplots'] == {}
+
+    mocker.patch('freqtrade.rpc.api_server.api_v1.get_rpc_optional', return_value=None)
+
+    rc = client_get(client, f"{BASE_URI}/plot_config")
+    assert_response(rc)
 
 
 def test_api_strategies(botclient, tmpdir):
@@ -1553,13 +1608,13 @@ def test_list_available_pairs(botclient):
         client, f"{BASE_URI}/available_pairs?timeframe=1h")
     assert_response(rc)
     assert rc.json()['length'] == 1
-    assert rc.json()['pairs'] == ['XRP/USDT']
+    assert rc.json()['pairs'] == ['XRP/USDT:USDT']
 
     rc = client_get(
         client, f"{BASE_URI}/available_pairs?timeframe=1h&candletype=mark")
     assert_response(rc)
     assert rc.json()['length'] == 2
-    assert rc.json()['pairs'] == ['UNITTEST/USDT', 'XRP/USDT']
+    assert rc.json()['pairs'] == ['UNITTEST/USDT:USDT', 'XRP/USDT:USDT']
     assert len(rc.json()['pair_interval']) == 2
 
 
