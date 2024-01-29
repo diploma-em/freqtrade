@@ -21,6 +21,8 @@ class Kucoin(Exchange):
 
     _ft_has: Dict = {
         "stoploss_on_exchange": True,
+        "stop_price_param": "stopPrice",
+        "stop_price_prop": "stopPrice",
         "stoploss_order_types": {"limit": "limit", "market": "market"},
         "l2_limit_range": [20, 100],
         "l2_limit_range_required": False,
@@ -64,6 +66,7 @@ class Kucoin(Exchange):
         # ccxt returns status = 'closed' at the moment - which is information ccxt invented.
         # Since we rely on status heavily, we must set it to 'open' here.
         # ref: https://github.com/ccxt/ccxt/pull/16674, (https://github.com/ccxt/ccxt/pull/16553)
-        res['type'] = ordertype
-        res['status'] = 'open'
+        if not self._config['dry_run']:
+            res['type'] = ordertype
+            res['status'] = 'open'
         return res

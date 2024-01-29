@@ -29,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger("ft_rest_client")
 
 
-class FtRestClient():
+class FtRestClient:
 
     def __init__(self, serverurl, username=None, password=None):
 
@@ -112,6 +112,30 @@ class FtRestClient():
         """
         return self._get("count")
 
+    def entries(self, pair=None):
+        """Returns List of dicts containing all Trades, based on buy tag performance
+        Can either be average for all pairs or a specific pair provided
+
+        :return: json object
+        """
+        return self._get("entries", params={"pair": pair} if pair else None)
+
+    def exits(self, pair=None):
+        """Returns List of dicts containing all Trades, based on exit reason performance
+        Can either be average for all pairs or a specific pair provided
+
+        :return: json object
+        """
+        return self._get("exits", params={"pair": pair} if pair else None)
+
+    def mix_tags(self, pair=None):
+        """Returns List of dicts containing all Trades, based on entry_tag + exit_reason performance
+        Can either be average for all pairs or a specific pair provided
+
+        :return: json object
+        """
+        return self._get("mix_tags", params={"pair": pair} if pair else None)
+
     def locks(self):
         """Return current locks
 
@@ -133,6 +157,20 @@ class FtRestClient():
         :return: json object
         """
         return self._get("daily", params={"timescale": days} if days else None)
+
+    def weekly(self, weeks=None):
+        """Return the profits for each week, and amount of trades.
+
+        :return: json object
+        """
+        return self._get("weekly", params={"timescale": weeks} if weeks else None)
+
+    def monthly(self, months=None):
+        """Return the profits for each month, and amount of trades.
+
+        :return: json object
+        """
+        return self._get("monthly", params={"timescale": months} if months else None)
 
     def edge(self):
         """Return information about edge.
@@ -279,8 +317,9 @@ class FtRestClient():
         """
         data = {"pair": pair,
                 "side": side,
-                "price": price,
                 }
+        if price:
+            data['price'] = price
         return self._post("forceenter", data=data)
 
     def forceexit(self, tradeid, ordertype=None, amount=None):
@@ -313,6 +352,13 @@ class FtRestClient():
         """
         return self._get(f"strategy/{strategy}")
 
+    def pairlists_available(self):
+        """Lists available pairlist providers
+
+        :return: json object
+        """
+        return self._get("pairlists/available")
+
     def plot_config(self):
         """Return plot configuration if the strategy defines one.
 
@@ -340,18 +386,21 @@ class FtRestClient():
         :param limit: Limit result to the last n candles.
         :return: json object
         """
-        return self._get("pair_candles", params={
+        params = {
             "pair": pair,
             "timeframe": timeframe,
-            "limit": limit,
-        })
+        }
+        if limit:
+            params['limit'] = limit
+        return self._get("pair_candles", params=params)
 
-    def pair_history(self, pair, timeframe, strategy, timerange=None):
+    def pair_history(self, pair, timeframe, strategy, timerange=None, freqaimodel=None):
         """Return historic, analyzed dataframe
 
         :param pair: Pair to get data for
         :param timeframe: Only pairs with this timeframe available.
         :param strategy: Strategy to analyze and get values for
+        :param freqaimodel: FreqAI model to use for analysis
         :param timerange: Timerange to get data for (same format than --timerange endpoints)
         :return: json object
         """
@@ -359,6 +408,7 @@ class FtRestClient():
             "pair": pair,
             "timeframe": timeframe,
             "strategy": strategy,
+            "freqaimodel": freqaimodel,
             "timerange": timerange if timerange else '',
         })
 

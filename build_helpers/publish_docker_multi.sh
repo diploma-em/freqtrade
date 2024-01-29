@@ -2,6 +2,8 @@
 
 # The below assumes a correctly setup docker buildx environment
 
+IMAGE_NAME=freqtradeorg/freqtrade
+CACHE_IMAGE=freqtradeorg/freqtrade_cache
 # Replace / with _ to create a valid tag
 TAG=$(echo "${BRANCH_NAME}" | sed -e "s/\//_/g")
 TAG_PLOT=${TAG}_plot
@@ -11,7 +13,6 @@ TAG_PI="${TAG}_pi"
 
 PI_PLATFORM="linux/arm/v7"
 echo "Running for ${TAG}"
-CACHE_IMAGE=freqtradeorg/freqtrade_cache
 CACHE_TAG=${CACHE_IMAGE}:${TAG_PI}_cache
 
 # Add commit and commit_message to docker container
@@ -57,16 +58,16 @@ fi
 # Tag image for upload and next build step
 docker tag freqtrade:$TAG ${CACHE_IMAGE}:$TAG
 
-docker build --cache-from freqtrade:${TAG} --build-arg sourceimage=${CACHE_IMAGE} --build-arg sourcetag=${TAG} -t freqtrade:${TAG_PLOT} -f docker/Dockerfile.plot .
-docker build --cache-from freqtrade:${TAG} --build-arg sourceimage=${CACHE_IMAGE} --build-arg sourcetag=${TAG} -t freqtrade:${TAG_FREQAI} -f docker/Dockerfile.freqai .
-docker build --cache-from freqtrade:${TAG_FREQAI} --build-arg sourceimage=${CACHE_IMAGE} --build-arg sourcetag=${TAG_FREQAI} -t freqtrade:${TAG_FREQAI_RL} -f docker/Dockerfile.freqai_rl .
+docker build --build-arg sourceimage=freqtrade --build-arg sourcetag=${TAG} -t freqtrade:${TAG_PLOT} -f docker/Dockerfile.plot .
+docker build --build-arg sourceimage=freqtrade --build-arg sourcetag=${TAG} -t freqtrade:${TAG_FREQAI} -f docker/Dockerfile.freqai .
+docker build --build-arg sourceimage=freqtrade --build-arg sourcetag=${TAG_FREQAI} -t freqtrade:${TAG_FREQAI_RL} -f docker/Dockerfile.freqai_rl .
 
 docker tag freqtrade:$TAG_PLOT ${CACHE_IMAGE}:$TAG_PLOT
 docker tag freqtrade:$TAG_FREQAI ${CACHE_IMAGE}:$TAG_FREQAI
 docker tag freqtrade:$TAG_FREQAI_RL ${CACHE_IMAGE}:$TAG_FREQAI_RL
 
 # Run backtest
-docker run --rm -v $(pwd)/config_examples/config_bittrex.example.json:/freqtrade/config.json:ro -v $(pwd)/tests:/tests freqtrade:${TAG} backtesting --datadir /tests/testdata --strategy-path /tests/strategy/strats/ --strategy StrategyTestV3
+docker run --rm -v $(pwd)/tests/testdata/config.tests.json:/freqtrade/config.json:ro -v $(pwd)/tests:/tests freqtrade:${TAG} backtesting --datadir /tests/testdata --strategy-path /tests/strategy/strats/ --strategy StrategyTestV3
 
 if [ $? -ne 0 ]; then
     echo "failed running backtest"

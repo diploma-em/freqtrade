@@ -6,7 +6,7 @@ import talib.abstract as ta
 from pandas import DataFrame
 from technical import qtpylib
 
-from freqtrade.strategy import CategoricalParameter, IStrategy
+from freqtrade.strategy import IStrategy
 
 
 logger = logging.getLogger(__name__)
@@ -15,12 +15,15 @@ logger = logging.getLogger(__name__)
 class FreqaiExampleStrategy(IStrategy):
     """
     Example strategy showing how the user connects their own
-    IFreqaiModel to the strategy. Namely, the user uses:
-    self.freqai.start(dataframe, metadata)
+    IFreqaiModel to the strategy.
 
-    to make predictions on their data. feature_engineering_*() automatically
-    generate the variety of features indicated by the user in the
-    canonical freqtrade configuration file under config['freqai'].
+    Warning! This is a showcase of functionality,
+    which means that it is designed to show various functions of FreqAI
+    and it runs on all computers. We use this showcase to help users
+    understand how to build a strategy, and we use it as a benchmark
+    to help debug possible problems.
+
+    This means this is *not* meant to be run live in production.
     """
 
     minimal_roi = {"0": 0.1, "240": -1}
@@ -28,7 +31,7 @@ class FreqaiExampleStrategy(IStrategy):
     plot_config = {
         "main_plot": {},
         "subplots": {
-            "&-s_close": {"prediction": {"color": "blue"}},
+            "&-s_close": {"&-s_close": {"color": "blue"}},
             "do_predict": {
                 "do_predict": {"color": "brown"},
             },
@@ -42,13 +45,8 @@ class FreqaiExampleStrategy(IStrategy):
     startup_candle_count: int = 40
     can_short = True
 
-    std_dev_multiplier_buy = CategoricalParameter(
-        [0.75, 1, 1.25, 1.5, 1.75], default=1.25, space="buy", optimize=True)
-    std_dev_multiplier_sell = CategoricalParameter(
-        [0.75, 1, 1.25, 1.5, 1.75], space="sell", default=1.25, optimize=True)
-
     def feature_engineering_expand_all(self, dataframe: DataFrame, period: int,
-                                       metadata: Dict, **kwargs):
+                                       metadata: Dict, **kwargs) -> DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         This function will automatically expand the defined features on the config defined
@@ -106,7 +104,8 @@ class FreqaiExampleStrategy(IStrategy):
 
         return dataframe
 
-    def feature_engineering_expand_basic(self, dataframe: DataFrame, metadata: Dict, **kwargs):
+    def feature_engineering_expand_basic(
+            self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         This function will automatically expand the defined features on the config defined
@@ -142,7 +141,8 @@ class FreqaiExampleStrategy(IStrategy):
         dataframe["%-raw_price"] = dataframe["close"]
         return dataframe
 
-    def feature_engineering_standard(self, dataframe: DataFrame, metadata: Dict, **kwargs):
+    def feature_engineering_standard(
+            self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         This optional function will be called once with the dataframe of the base timeframe.
@@ -172,7 +172,7 @@ class FreqaiExampleStrategy(IStrategy):
         dataframe["%-hour_of_day"] = dataframe["date"].dt.hour
         return dataframe
 
-    def set_freqai_targets(self, dataframe: DataFrame, metadata: Dict, **kwargs):
+    def set_freqai_targets(self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
         """
         *Only functional with FreqAI enabled strategies*
         Required function to set the targets for the model.
@@ -227,28 +227,20 @@ class FreqaiExampleStrategy(IStrategy):
 
         # All indicators must be populated by feature_engineering_*() functions
 
-        # the model will return all labels created by user in `feature_engineering_*`
+        # the model will return all labels created by user in `set_freqai_targets()`
         # (& appended targets), an indication of whether or not the prediction should be accepted,
         # the target mean/std values for each of the labels created by user in
         # `set_freqai_targets()` for each training period.
 
         dataframe = self.freqai.start(dataframe, metadata, self)
 
-        for val in self.std_dev_multiplier_buy.range:
-            dataframe[f'target_roi_{val}'] = (
-                dataframe["&-s_close_mean"] + dataframe["&-s_close_std"] * val
-                )
-        for val in self.std_dev_multiplier_sell.range:
-            dataframe[f'sell_roi_{val}'] = (
-                dataframe["&-s_close_mean"] - dataframe["&-s_close_std"] * val
-                )
         return dataframe
 
     def populate_entry_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
 
         enter_long_conditions = [
             df["do_predict"] == 1,
-            df["&-s_close"] > df[f"target_roi_{self.std_dev_multiplier_buy.value}"],
+            df["&-s_close"] > 0.01,
             ]
 
         if enter_long_conditions:
@@ -258,7 +250,7 @@ class FreqaiExampleStrategy(IStrategy):
 
         enter_short_conditions = [
             df["do_predict"] == 1,
-            df["&-s_close"] < df[f"sell_roi_{self.std_dev_multiplier_sell.value}"],
+            df["&-s_close"] < -0.01,
             ]
 
         if enter_short_conditions:
@@ -271,22 +263,19 @@ class FreqaiExampleStrategy(IStrategy):
     def populate_exit_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
         exit_long_conditions = [
             df["do_predict"] == 1,
-            df["&-s_close"] < df[f"sell_roi_{self.std_dev_multiplier_sell.value}"] * 0.25,
+            df["&-s_close"] < 0
             ]
         if exit_long_conditions:
             df.loc[reduce(lambda x, y: x & y, exit_long_conditions), "exit_long"] = 1
 
         exit_short_conditions = [
             df["do_predict"] == 1,
-            df["&-s_close"] > df[f"target_roi_{self.std_dev_multiplier_buy.value}"] * 0.25,
+            df["&-s_close"] > 0
             ]
         if exit_short_conditions:
             df.loc[reduce(lambda x, y: x & y, exit_short_conditions), "exit_short"] = 1
 
         return df
-
-    def get_ticker_indicator(self):
-        return int(self.config["timeframe"][:-1])
 
     def confirm_trade_entry(
         self,

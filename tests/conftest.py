@@ -3,27 +3,26 @@ import json
 import logging
 import re
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, Mock, PropertyMock
 
-import arrow
 import numpy as np
 import pandas as pd
 import pytest
-from telegram import Chat, Message, Update
+from xdist.scheduler.loadscope import LoadScopeScheduling
 
 from freqtrade import constants
 from freqtrade.commands import Arguments
-from freqtrade.data.converter import ohlcv_to_dataframe
+from freqtrade.data.converter import ohlcv_to_dataframe, trades_list_to_df
 from freqtrade.edge import PairInfo
 from freqtrade.enums import CandleType, MarginMode, RunMode, SignalDirection, TradingMode
-from freqtrade.exchange import Exchange
-from freqtrade.exchange.exchange import timeframe_to_minutes
+from freqtrade.exchange import Exchange, timeframe_to_minutes, timeframe_to_seconds
 from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.persistence import LocalTrade, Order, Trade, init_db
 from freqtrade.resolvers import ExchangeResolver
+from freqtrade.util import dt_now, dt_ts
 from freqtrade.worker import Worker
 from tests.conftest_trades import (leverage_trade, mock_trade_1, mock_trade_2, mock_trade_3,
                                    mock_trade_4, mock_trade_5, mock_trade_6, short_trade)
@@ -40,6 +39,7 @@ np.seterr(all='raise')
 
 CURRENT_TEST_STRATEGY = 'StrategyTestV3'
 TRADE_SIDES = ('long', 'short')
+EXMS = 'freqtrade.exchange.exchange.Exchange'
 
 
 def pytest_addoption(parser):
@@ -53,6 +53,27 @@ def pytest_configure(config):
     )
     if not config.option.longrun:
         setattr(config.option, 'markexpr', 'not longrun')
+
+
+class FixtureScheduler(LoadScopeScheduling):
+    # Based on the suggestion in
+    # https://github.com/pytest-dev/pytest-xdist/issues/18
+
+    def _split_scope(self, nodeid):
+        if 'exchange_online' in nodeid:
+            try:
+                # Extract exchange ID from nodeid
+                exchange_id = nodeid.split('[')[1].split('-')[0].rstrip(']')
+                return exchange_id
+            except Exception as e:
+                print(e)
+                pass
+
+        return nodeid
+
+
+def pytest_xdist_make_scheduler(config, log):
+    return FixtureScheduler(config, log)
 
 
 def log_has(line, logs):
@@ -84,13 +105,62 @@ def get_args(args):
     return Arguments(args).get_parsed_arg()
 
 
+def generate_trades_history(n_rows, start_date: Optional[datetime] = None, days=5):
+    np.random.seed(42)
+    if not start_date:
+        start_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        # Generate random data
+    end_date = start_date + timedelta(days=days)
+    _start_timestamp = start_date.timestamp()
+    _end_timestamp = pd.to_datetime(end_date).timestamp()
+
+    random_timestamps_in_seconds = np.random.uniform(_start_timestamp, _end_timestamp, n_rows)
+    timestamp = pd.to_datetime(random_timestamps_in_seconds, unit='s')
+
+    id = [
+        f'a{np.random.randint(1e6, 1e7 - 1)}cd{np.random.randint(100, 999)}'
+        for _ in range(n_rows)
+    ]
+
+    side = np.random.choice(['buy', 'sell'], n_rows)
+
+    # Initial price and subsequent changes
+    initial_price = 0.019626
+    price_changes = np.random.normal(0, initial_price * 0.05, n_rows)
+    price = np.cumsum(np.concatenate(([initial_price], price_changes)))[:n_rows]
+
+    amount = np.random.uniform(0.011, 20, n_rows)
+    cost = price * amount
+
+    # Create DataFrame
+    df = pd.DataFrame({'timestamp': timestamp, 'id': id, 'type': None, 'side': side,
+                       'price': price, 'amount': amount, 'cost': cost})
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    assert list(df.columns) == constants.DEFAULT_TRADES_COLUMNS + ['date']
+    return df
+
+
 def generate_test_data(timeframe: str, size: int, start: str = '2020-07-05'):
     np.random.seed(42)
-    tf_mins = timeframe_to_minutes(timeframe)
 
     base = np.random.normal(20, 2, size=size)
-
-    date = pd.date_range(start, periods=size, freq=f'{tf_mins}min', tz='UTC')
+    if timeframe == '1y':
+        date = pd.date_range(start, periods=size, freq='1YS', tz='UTC')
+    elif timeframe == '1M':
+        date = pd.date_range(start, periods=size, freq='1MS', tz='UTC')
+    elif timeframe == '3M':
+        date = pd.date_range(start, periods=size, freq='3MS', tz='UTC')
+    elif timeframe == '1w' or timeframe == '7d':
+        date = pd.date_range(start, periods=size, freq='1W-MON', tz='UTC')
+    else:
+        tf_mins = timeframe_to_minutes(timeframe)
+        if tf_mins >= 1:
+            date = pd.date_range(start, periods=size, freq=f'{tf_mins}min', tz='UTC')
+        else:
+            tf_secs = timeframe_to_seconds(timeframe)
+            date = pd.date_range(start, periods=size, freq=f'{tf_secs}s', tz='UTC')
     df = pd.DataFrame({
         'date': date,
         'open': base,
@@ -145,22 +215,21 @@ def patch_exchange(
     mock_markets=True,
     mock_supported_modes=True
 ) -> None:
-    mocker.patch('freqtrade.exchange.Exchange._load_async_markets', MagicMock(return_value={}))
-    mocker.patch('freqtrade.exchange.Exchange.validate_config', MagicMock())
-    mocker.patch('freqtrade.exchange.Exchange.validate_timeframes', MagicMock())
-    mocker.patch('freqtrade.exchange.Exchange.id', PropertyMock(return_value=id))
-    mocker.patch('freqtrade.exchange.Exchange.name', PropertyMock(return_value=id.title()))
-    mocker.patch('freqtrade.exchange.Exchange.precisionMode', PropertyMock(return_value=2))
+    mocker.patch(f'{EXMS}._load_async_markets', return_value={})
+    mocker.patch(f'{EXMS}.validate_config', MagicMock())
+    mocker.patch(f'{EXMS}.validate_timeframes', MagicMock())
+    mocker.patch(f'{EXMS}.id', PropertyMock(return_value=id))
+    mocker.patch(f'{EXMS}.name', PropertyMock(return_value=id.title()))
+    mocker.patch(f'{EXMS}.precisionMode', PropertyMock(return_value=2))
 
     if mock_markets:
         if isinstance(mock_markets, bool):
             mock_markets = get_markets()
-        mocker.patch('freqtrade.exchange.Exchange.markets',
-                     PropertyMock(return_value=mock_markets))
+        mocker.patch(f'{EXMS}.markets', PropertyMock(return_value=mock_markets))
 
     if mock_supported_modes:
         mocker.patch(
-            f'freqtrade.exchange.{id.capitalize()}._supported_trading_mode_margin_pairs',
+            f'freqtrade.exchange.{id}.{id.capitalize()}._supported_trading_mode_margin_pairs',
             PropertyMock(return_value=[
                 (TradingMode.MARGIN, MarginMode.CROSS),
                 (TradingMode.MARGIN, MarginMode.ISOLATED),
@@ -170,10 +239,10 @@ def patch_exchange(
         )
 
     if api_mock:
-        mocker.patch('freqtrade.exchange.Exchange._init_ccxt', MagicMock(return_value=api_mock))
+        mocker.patch(f'{EXMS}._init_ccxt', return_value=api_mock)
     else:
-        mocker.patch('freqtrade.exchange.Exchange._init_ccxt', MagicMock())
-        mocker.patch('freqtrade.exchange.Exchange.timeframes', PropertyMock(
+        mocker.patch(f'{EXMS}._init_ccxt', MagicMock())
+        mocker.patch(f'{EXMS}.timeframes', PropertyMock(
                 return_value=['5m', '15m', '1h', '1d']))
 
 
@@ -182,7 +251,7 @@ def get_patched_exchange(mocker, config, api_mock=None, id='binance',
     patch_exchange(mocker, api_mock, id, mock_markets, mock_supported_modes)
     config['exchange']['name'] = id
     try:
-        exchange = ExchangeResolver.load_exchange(id, config, load_leverage_tiers=True)
+        exchange = ExchangeResolver.load_exchange(config, load_leverage_tiers=True)
     except ImportError:
         exchange = Exchange(config)
     return exchange
@@ -299,7 +368,7 @@ def create_mock_trades(fee, is_short: Optional[bool] = False, use_db: bool = Tru
     """
     def add_trade(trade):
         if use_db:
-            Trade.query.session.add(trade)
+            Trade.session.add(trade)
         else:
             LocalTrade.add_bt_trade(trade)
     is_short1 = is_short if is_short is not None else True
@@ -332,11 +401,11 @@ def create_mock_trades_with_leverage(fee, use_db: bool = True):
     Create some fake trades ...
     """
     if use_db:
-        Trade.query.session.rollback()
+        Trade.session.rollback()
 
     def add_trade(trade):
         if use_db:
-            Trade.query.session.add(trade)
+            Trade.session.add(trade)
         else:
             LocalTrade.add_bt_trade(trade)
 
@@ -366,7 +435,7 @@ def create_mock_trades_with_leverage(fee, use_db: bool = True):
     add_trade(trade)
 
     if use_db:
-        Trade.query.session.flush()
+        Trade.session.flush()
 
 
 def create_mock_trades_usdt(fee, is_short: Optional[bool] = False, use_db: bool = True):
@@ -375,7 +444,7 @@ def create_mock_trades_usdt(fee, is_short: Optional[bool] = False, use_db: bool 
     """
     def add_trade(trade):
         if use_db:
-            Trade.query.session.add(trade)
+            Trade.session.add(trade)
         else:
             LocalTrade.add_bt_trade(trade)
 
@@ -410,6 +479,14 @@ def create_mock_trades_usdt(fee, is_short: Optional[bool] = False, use_db: bool 
 @pytest.fixture(autouse=True)
 def patch_gc(mocker) -> None:
     mocker.patch("freqtrade.main.gc_set_threshold")
+
+
+@pytest.fixture(autouse=True)
+def user_dir(mocker, tmp_path) -> Path:
+    user_dir = tmp_path / "user_data"
+    mocker.patch('freqtrade.configuration.configuration.create_userdata_dir',
+                 return_value=user_dir)
+    return user_dir
 
 
 @pytest.fixture(autouse=True)
@@ -486,7 +563,6 @@ def get_default_conf(testdatadir):
         },
         "exchange": {
             "name": "binance",
-            "enabled": True,
             "key": "key",
             "secret": "secret",
             "pair_whitelist": [
@@ -504,7 +580,7 @@ def get_default_conf(testdatadir):
             {"method": "StaticPairList"}
         ],
         "telegram": {
-            "enabled": True,
+            "enabled": False,
             "token": "token",
             "chat_id": "0",
             "notification_settings": {},
@@ -519,6 +595,8 @@ def get_default_conf(testdatadir):
         "disableparamexport": True,
         "internals": {},
         "export": "none",
+        "dataformat_ohlcv": "feather",
+        "runmode": "dry_run",
         "candle_type_def": CandleType.SPOT,
     }
     return configuration
@@ -548,13 +626,6 @@ def get_default_conf_usdt(testdatadir):
         },
     })
     return configuration
-
-
-@pytest.fixture
-def update():
-    _update = Update(0)
-    _update.message = Message(0, datetime.utcnow(), Chat(0, 0))
-    return _update
 
 
 @pytest.fixture
@@ -923,6 +994,58 @@ def get_markets():
                 },
                 'price': {
                     'min': 1e-08,
+                    'max': None,
+                },
+                'cost': {
+                    'min': None,
+                    'max': None,
+                },
+            },
+            'info': {
+                'maintenance_rate': '0.005',
+            },
+        },
+        'BTC/USDT': {
+            'id': 'USDT-BTC',
+            'symbol': 'BTC/USDT',
+            'base': 'BTC',
+            'quote': 'USDT',
+            'settle': None,
+            'baseId': 'BTC',
+            'quoteId': 'USDT',
+            'settleId': None,
+            'type': 'spot',
+            'spot': True,
+            'margin': True,
+            'swap': False,
+            'future': False,
+            'option': False,
+            'active': True,
+            'contract': None,
+            'linear': None,
+            'inverse': None,
+            'taker': 0.0006,
+            'maker': 0.0002,
+            'contractSize': None,
+            'expiry': None,
+            'expiryDateTime': None,
+            'strike': None,
+            'optionType': None,
+            'precision': {
+                'amount': 4,
+                'price': 4,
+            },
+            'limits': {
+                'leverage': {
+                    'min': 1,
+                    'max': 100,
+                },
+                'amount': {
+                    'min': 0.000221,
+                    'max': None,
+                },
+                'price': {
+                    'min': 1e-02,
                     'max': None,
                 },
                 'cost': {
@@ -1664,8 +1787,8 @@ def limit_buy_order_open():
         'type': 'limit',
         'side': 'buy',
         'symbol': 'mocked',
-        'timestamp': arrow.utcnow().int_timestamp * 1000,
-        'datetime': arrow.utcnow().isoformat(),
+        'timestamp': dt_ts(),
+        'datetime': dt_now().isoformat(),
         'price': 0.00001099,
         'average': 0.00001099,
         'amount': 90.99181073,
@@ -1692,8 +1815,8 @@ def limit_buy_order_old():
         'type': 'limit',
         'side': 'buy',
         'symbol': 'mocked',
-        'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
-        'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
+        'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
+        'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
         'price': 0.00001099,
         'amount': 90.99181073,
         'filled': 0.0,
@@ -1709,8 +1832,8 @@ def limit_sell_order_old():
         'type': 'limit',
         'side': 'sell',
         'symbol': 'ETH/BTC',
-        'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
-        'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
+        'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
+        'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
         'price': 0.00001099,
         'amount': 90.99181073,
         'filled': 0.0,
@@ -1726,8 +1849,8 @@ def limit_buy_order_old_partial():
         'type': 'limit',
         'side': 'buy',
         'symbol': 'ETH/BTC',
-        'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
-        'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
+        'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
+        'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
         'price': 0.00001099,
         'amount': 90.99181073,
         'filled': 23.0,
@@ -1757,8 +1880,8 @@ def limit_buy_order_canceled_empty(request):
             'info': {},
             'id': 'AZNPFF-4AC4N-7MKTAT',
             'clientOrderId': None,
-            'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
-            'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
+            'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
+            'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
             'lastTradeTimestamp': None,
             'status': 'canceled',
             'symbol': 'LTC/USDT',
@@ -1778,8 +1901,8 @@ def limit_buy_order_canceled_empty(request):
             'info': {},
             'id': '1234512345',
             'clientOrderId': 'alb1234123',
-            'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
-            'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
+            'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
+            'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
             'lastTradeTimestamp': None,
             'symbol': 'LTC/USDT',
             'type': 'limit',
@@ -1799,8 +1922,8 @@ def limit_buy_order_canceled_empty(request):
             'info': {},
             'id': '1234512345',
             'clientOrderId': 'alb1234123',
-            'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
-            'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
+            'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
+            'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
             'lastTradeTimestamp': None,
             'symbol': 'LTC/USDT',
             'type': 'limit',
@@ -1824,8 +1947,8 @@ def limit_sell_order_open():
         'type': 'limit',
         'side': 'sell',
         'symbol': 'mocked',
-        'datetime': arrow.utcnow().isoformat(),
-        'timestamp': arrow.utcnow().int_timestamp * 1000,
+        'datetime': dt_now().isoformat(),
+        'timestamp': dt_ts(),
         'price': 0.00001173,
         'amount': 90.99181073,
         'filled': 0.0,
@@ -2345,19 +2468,20 @@ def trades_history():
             [1565798399629, '1261813bb30', None, 'buy', 0.019627, 0.244, 0.004788987999999999],
             [1565798399752, '1261813cc31', None, 'sell', 0.019626, 0.011, 0.00021588599999999999],
             [1565798399862, '126181cc332', None, 'sell', 0.019626, 0.011, 0.00021588599999999999],
-            [1565798399872, '1261aa81333', None, 'sell', 0.019626, 0.011, 0.00021588599999999999]]
+            [1565798399862, '126181cc333', None, 'sell', 0.019626, 0.012, 0.00021588599999999999],
+            [1565798399872, '1261aa81334', None, 'sell', 0.019626, 0.011, 0.00021588599999999999]]
+
+
+@pytest.fixture(scope="function")
+def trades_history_df(trades_history):
+    trades = trades_list_to_df(trades_history)
+    trades['date'] = pd.to_datetime(trades['timestamp'], unit='ms', utc=True)
+    return trades
 
 
 @pytest.fixture(scope="function")
 def fetch_trades_result():
-    return [{'info': {'a': 126181329,
-                      'p': '0.01962700',
-                      'q': '0.04000000',
-                      'f': 138604155,
-                      'l': 138604155,
-                      'T': 1565798399463,
-                      'm': False,
-                      'M': True},
+    return [{'info': ['0.01962700', '0.04000000', '1565798399.4631551', 'b', 'm', '', '126181329'],
              'timestamp': 1565798399463,
              'datetime': '2019-08-14T15:59:59.463Z',
              'symbol': 'ETH/BTC',
@@ -2370,14 +2494,7 @@ def fetch_trades_result():
              'amount': 0.04,
              'cost': 0.00078508,
              'fee': None},
-            {'info': {'a': 126181330,
-                      'p': '0.01962700',
-                      'q': '0.24400000',
-                      'f': 138604156,
-                      'l': 138604156,
-                      'T': 1565798399629,
-                      'm': False,
-                      'M': True},
+            {'info': ['0.01962700', '0.24400000', '1565798399.6291551', 'b', 'm', '', '126181330'],
              'timestamp': 1565798399629,
              'datetime': '2019-08-14T15:59:59.629Z',
              'symbol': 'ETH/BTC',
@@ -2390,14 +2507,7 @@ def fetch_trades_result():
              'amount': 0.244,
              'cost': 0.004788987999999999,
              'fee': None},
-            {'info': {'a': 126181331,
-                      'p': '0.01962600',
-                      'q': '0.01100000',
-                      'f': 138604157,
-                      'l': 138604157,
-                      'T': 1565798399752,
-                      'm': True,
-                      'M': True},
+            {'info': ['0.01962600', '0.01100000', '1565798399.7521551', 's', 'm', '', '126181331'],
              'timestamp': 1565798399752,
              'datetime': '2019-08-14T15:59:59.752Z',
              'symbol': 'ETH/BTC',
@@ -2410,14 +2520,7 @@ def fetch_trades_result():
              'amount': 0.011,
              'cost': 0.00021588599999999999,
              'fee': None},
-            {'info': {'a': 126181332,
-                      'p': '0.01962600',
-                      'q': '0.01100000',
-                      'f': 138604158,
-                      'l': 138604158,
-                      'T': 1565798399862,
-                      'm': True,
-                      'M': True},
+            {'info': ['0.01962600', '0.01100000', '1565798399.8621551', 's', 'm', '', '126181332'],
              'timestamp': 1565798399862,
              'datetime': '2019-08-14T15:59:59.862Z',
              'symbol': 'ETH/BTC',
@@ -2430,14 +2533,8 @@ def fetch_trades_result():
              'amount': 0.011,
              'cost': 0.00021588599999999999,
              'fee': None},
-            {'info': {'a': 126181333,
-                      'p': '0.01952600',
-                      'q': '0.01200000',
-                      'f': 138604158,
-                      'l': 138604158,
-                      'T': 1565798399872,
-                      'm': True,
-                      'M': True},
+            {'info': ['0.01952600', '0.01200000', '1565798399.8721551', 's', 'm', '', '126181333',
+                      1565798399872512133],
              'timestamp': 1565798399872,
              'datetime': '2019-08-14T15:59:59.872Z',
              'symbol': 'ETH/BTC',
@@ -2487,8 +2584,8 @@ def buy_order_fee():
         'type': 'limit',
         'side': 'buy',
         'symbol': 'mocked',
-        'timestamp': arrow.utcnow().shift(minutes=-601).int_timestamp * 1000,
-        'datetime': arrow.utcnow().shift(minutes=-601).isoformat(),
+        'timestamp': dt_ts(dt_now() - timedelta(minutes=601)),
+        'datetime': (dt_now() - timedelta(minutes=601)).isoformat(),
         'price': 0.245441,
         'amount': 8.0,
         'cost': 1.963528,
@@ -2573,7 +2670,7 @@ def import_fails() -> None:
     realimport = builtins.__import__
 
     def mockedimport(name, *args, **kwargs):
-        if name in ["filelock", 'systemd.journal', 'uvloop']:
+        if name in ["filelock", 'cysystemd.journal', 'uvloop']:
             raise ImportError(f"No module named '{name}'")
         return realimport(name, *args, **kwargs)
 
@@ -2592,19 +2689,18 @@ def open_trade():
         pair='ETH/BTC',
         open_rate=0.00001099,
         exchange='binance',
-        open_order_id='123456789',
         amount=90.99181073,
         fee_open=0.0,
         fee_close=0.0,
         stake_amount=1,
-        open_date=arrow.utcnow().shift(minutes=-601).datetime,
+        open_date=dt_now() - timedelta(minutes=601),
         is_open=True
     )
     trade.orders = [
         Order(
             ft_order_side='buy',
             ft_pair=trade.pair,
-            ft_is_open=False,
+            ft_is_open=True,
             ft_amount=trade.amount,
             ft_price=trade.open_rate,
             order_id='123456789',
@@ -2630,12 +2726,11 @@ def open_trade_usdt():
         pair='ADA/USDT',
         open_rate=2.0,
         exchange='binance',
-        open_order_id='123456789_exit',
         amount=30.0,
         fee_open=0.0,
         fee_close=0.0,
         stake_amount=60.0,
-        open_date=arrow.utcnow().shift(minutes=-601).datetime,
+        open_date=dt_now() - timedelta(minutes=601),
         is_open=True
     )
     trade.orders = [
@@ -2839,8 +2934,8 @@ def limit_buy_order_usdt_open():
         'type': 'limit',
         'side': 'buy',
         'symbol': 'mocked',
-        'datetime': arrow.utcnow().isoformat(),
-        'timestamp': arrow.utcnow().int_timestamp * 1000,
+        'datetime': dt_now().isoformat(),
+        'timestamp': dt_ts(),
         'price': 2.00,
         'average': 2.00,
         'amount': 30.0,
@@ -2867,8 +2962,8 @@ def limit_sell_order_usdt_open():
         'type': 'limit',
         'side': 'sell',
         'symbol': 'mocked',
-        'datetime': arrow.utcnow().isoformat(),
-        'timestamp': arrow.utcnow().int_timestamp * 1000,
+        'datetime': dt_now().isoformat(),
+        'timestamp': dt_ts(),
         'price': 2.20,
         'amount': 30.0,
         'cost': 66.0,
@@ -2894,8 +2989,8 @@ def market_buy_order_usdt():
         'type': 'market',
         'side': 'buy',
         'symbol': 'mocked',
-        'timestamp': arrow.utcnow().int_timestamp * 1000,
-        'datetime': arrow.utcnow().isoformat(),
+        'timestamp': dt_ts(),
+        'datetime': dt_now().isoformat(),
         'price': 2.00,
         'amount': 30.0,
         'filled': 30.0,
@@ -2951,8 +3046,8 @@ def market_sell_order_usdt():
         'type': 'market',
         'side': 'sell',
         'symbol': 'mocked',
-        'timestamp': arrow.utcnow().int_timestamp * 1000,
-        'datetime': arrow.utcnow().isoformat(),
+        'timestamp': dt_ts(),
+        'datetime': dt_now().isoformat(),
         'price': 2.20,
         'amount': 30.0,
         'filled': 30.0,
@@ -3001,85 +3096,85 @@ def mark_ohlcv():
 def funding_rate_history_hourly():
     return [
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000008,
             "timestamp": 1630454400000,
             "datetime": "2021-09-01T00:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000004,
             "timestamp": 1630458000000,
             "datetime": "2021-09-01T01:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000012,
             "timestamp": 1630461600000,
             "datetime": "2021-09-01T02:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000003,
             "timestamp": 1630465200000,
             "datetime": "2021-09-01T03:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000007,
             "timestamp": 1630468800000,
             "datetime": "2021-09-01T04:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000003,
             "timestamp": 1630472400000,
             "datetime": "2021-09-01T05:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000019,
             "timestamp": 1630476000000,
             "datetime": "2021-09-01T06:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000003,
             "timestamp": 1630479600000,
             "datetime": "2021-09-01T07:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000003,
             "timestamp": 1630483200000,
             "datetime": "2021-09-01T08:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0,
             "timestamp": 1630486800000,
             "datetime": "2021-09-01T09:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000013,
             "timestamp": 1630490400000,
             "datetime": "2021-09-01T10:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000077,
             "timestamp": 1630494000000,
             "datetime": "2021-09-01T11:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000072,
             "timestamp": 1630497600000,
             "datetime": "2021-09-01T12:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": 0.000097,
             "timestamp": 1630501200000,
             "datetime": "2021-09-01T13:00:00.000Z"
@@ -3091,13 +3186,13 @@ def funding_rate_history_hourly():
 def funding_rate_history_octohourly():
     return [
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000008,
             "timestamp": 1630454400000,
             "datetime": "2021-09-01T00:00:00.000Z"
         },
         {
-            "symbol": "ADA/USDT",
+            "symbol": "ADA/USDT:USDT",
             "fundingRate": -0.000003,
             "timestamp": 1630483200000,
             "datetime": "2021-09-01T08:00:00.000Z"

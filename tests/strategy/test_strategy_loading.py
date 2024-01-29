@@ -35,7 +35,7 @@ def test_search_all_strategies_no_failed():
     directory = Path(__file__).parent / "strats"
     strategies = StrategyResolver._search_all_objects(directory, enum_failed=False)
     assert isinstance(strategies, list)
-    assert len(strategies) == 12
+    assert len(strategies) == 13
     assert isinstance(strategies[0], dict)
 
 
@@ -43,10 +43,10 @@ def test_search_all_strategies_with_failed():
     directory = Path(__file__).parent / "strats"
     strategies = StrategyResolver._search_all_objects(directory, enum_failed=True)
     assert isinstance(strategies, list)
-    assert len(strategies) == 13
+    assert len(strategies) == 14
     # with enum_failed=True search_all_objects() shall find 2 good strategies
     # and 1 which fails to load
-    assert len([x for x in strategies if x['class'] is not None]) == 12
+    assert len([x for x in strategies if x['class'] is not None]) == 13
 
     assert len([x for x in strategies if x['class'] is None]) == 1
 
@@ -69,7 +69,7 @@ def test_load_strategy(default_conf, dataframe_1m):
 def test_load_strategy_base64(dataframe_1m, caplog, default_conf):
     filepath = Path(__file__).parents[2] / 'freqtrade/templates/sample_strategy.py'
     encoded_string = urlsafe_b64encode(filepath.read_bytes()).decode("utf-8")
-    default_conf.update({'strategy': 'SampleStrategy:{}'.format(encoded_string)})
+    default_conf.update({'strategy': f'SampleStrategy:{encoded_string}'})
 
     strategy = StrategyResolver.load_strategy(default_conf)
     assert 'rsi' in strategy.advise_indicators(dataframe_1m, {'pair': 'ETH/BTC'})

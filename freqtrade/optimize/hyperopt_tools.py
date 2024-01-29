@@ -1,4 +1,3 @@
-import io
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -15,14 +14,17 @@ from pandas import isna, json_normalize
 from freqtrade.constants import FTHYPT_FILEVERSION, Config
 from freqtrade.enums import HyperoptState
 from freqtrade.exceptions import OperationalException
-from freqtrade.misc import deep_merge_dicts, round_coin_value, round_dict, safe_value_fallback2
+from freqtrade.misc import deep_merge_dicts, round_dict, safe_value_fallback2
 from freqtrade.optimize.hyperopt_epoch_filters import hyperopt_filter_epochs
 from freqtrade.optimize.optimize_reports import generate_wins_draws_losses
+from freqtrade.util import fmt_coin
 
 
 logger = logging.getLogger(__name__)
 
 NON_OPT_PARAM_APPENDIX = "  # value loaded from strategy"
+
+HYPER_PARAMS_FILE_FORMAT = rapidjson.NM_NATIVE | rapidjson.NM_NAN
 
 
 def hyperopt_serializer(x):
@@ -34,7 +36,7 @@ def hyperopt_serializer(x):
     return str(x)
 
 
-class HyperoptStateContainer():
+class HyperoptStateContainer:
     """ Singleton class to track state of hyperopt"""
     state: HyperoptState = HyperoptState.OPTIMIZE
 
@@ -43,7 +45,7 @@ class HyperoptStateContainer():
         cls.state = value
 
 
-class HyperoptTools():
+class HyperoptTools:
 
     @staticmethod
     def get_strategy_filename(config: Config, strategy_name: str) -> Optional[Path]:
@@ -77,8 +79,17 @@ class HyperoptTools():
         with filename.open('w') as f:
             rapidjson.dump(final_params, f, indent=2,
                            default=hyperopt_serializer,
-                           number_mode=rapidjson.NM_NATIVE | rapidjson.NM_NAN
+                           number_mode=HYPER_PARAMS_FILE_FORMAT
                            )
+
+    @staticmethod
+    def load_params(filename: Path) -> Dict:
+        """
+        Load parameters from file
+        """
+        with filename.open('r') as f:
+            params = rapidjson.load(f, number_mode=HYPER_PARAMS_FILE_FORMAT)
+        return params
 
     @staticmethod
     def try_export_params(config: Config, strategy_name: str, params: Dict):
@@ -190,7 +201,7 @@ class HyperoptTools():
             for s in ['buy', 'sell', 'protection',
                       'roi', 'stoploss', 'trailing', 'max_open_trades']:
                 HyperoptTools._params_update_for_json(result_dict, params, non_optimized, s)
-            print(rapidjson.dumps(result_dict, default=str, number_mode=rapidjson.NM_NATIVE))
+            print(rapidjson.dumps(result_dict, default=str, number_mode=HYPER_PARAMS_FILE_FORMAT))
 
         else:
             HyperoptTools._params_pretty_print(params, 'buy', "Buy hyperspace params:",
@@ -395,7 +406,7 @@ class HyperoptTools():
 
         trials[f"Max Drawdown{' (Acct)' if has_account_drawdown else ''}"] = trials.apply(
             lambda x: "{} {}".format(
-                round_coin_value(x['max_drawdown_abs'], stake_currency, keep_trailing_zeros=True),
+                fmt_coin(x['max_drawdown_abs'], stake_currency, keep_trailing_zeros=True),
                 (f"({x['max_drawdown_account']:,.2%})"
                     if has_account_drawdown
                     else f"({x['max_drawdown']:,.2%})"
@@ -410,7 +421,7 @@ class HyperoptTools():
 
         trials['Profit'] = trials.apply(
             lambda x: '{} {}'.format(
-                round_coin_value(x['Total profit'], stake_currency, keep_trailing_zeros=True),
+                fmt_coin(x['Total profit'], stake_currency, keep_trailing_zeros=True),
                 f"({x['Profit']:,.2%})".rjust(10, ' ')
             ).rjust(25 + len(stake_currency))
             if x['Total profit'] != 0.0 else '--'.rjust(25 + len(stake_currency)),
@@ -419,16 +430,18 @@ class HyperoptTools():
         trials = trials.drop(columns=['Total profit'])
 
         if print_colorized:
+            trials2 = trials.astype(str)
             for i in range(len(trials)):
                 if trials.loc[i]['is_profit']:
                     for j in range(len(trials.loc[i]) - 3):
-                        trials.iat[i, j] = "{}{}{}".format(Fore.GREEN,
-                                                           str(trials.loc[i][j]), Fore.RESET)
+                        trials2.iat[i, j] = f"{Fore.GREEN}{str(trials.iloc[i, j])}{Fore.RESET}"
                 if trials.loc[i]['is_best'] and highlight_best:
                     for j in range(len(trials.loc[i]) - 3):
-                        trials.iat[i, j] = "{}{}{}".format(Style.BRIGHT,
-                                                           str(trials.loc[i][j]), Style.RESET_ALL)
-
+                        trials2.iat[i, j] = (
+                            f"{Style.BRIGHT}{str(trials.iloc[i, j])}{Style.RESET_ALL}"
+                        )
+            trials = trials2
+            del trials2
         trials = trials.drop(columns=['is_initial_point', 'is_best', 'is_profit', 'is_random'])
         if remove_header > 0:
             table = tabulate.tabulate(
@@ -464,8 +477,8 @@ class HyperoptTools():
             return
 
         try:
-            io.open(csv_file, 'w+').close()
-        except IOError:
+            Path(csv_file).open('w+').close()
+        except OSError:
             logger.error(f"Failed to create CSV file: {csv_file}")
             return
 

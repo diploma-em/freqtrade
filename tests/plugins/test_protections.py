@@ -1,5 +1,5 @@
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -24,8 +24,8 @@ def generate_mock_trade(pair: str, fee: float, is_open: bool,
         stake_amount=0.01,
         fee_open=fee,
         fee_close=fee,
-        open_date=datetime.utcnow() - timedelta(minutes=min_ago_open or 200),
-        close_date=datetime.utcnow() - timedelta(minutes=min_ago_close or 30),
+        open_date=datetime.now(timezone.utc) - timedelta(minutes=min_ago_open or 200),
+        close_date=datetime.now(timezone.utc) - timedelta(minutes=min_ago_close or 30),
         open_rate=open_rate,
         is_open=is_open,
         amount=0.01 / open_rate,
@@ -74,7 +74,7 @@ def generate_mock_trade(pair: str, fee: float, is_open: bool,
         trade.close(close_price)
         trade.exit_reason = exit_reason
 
-    Trade.query.session.add(trade)
+    Trade.session.add(trade)
     Trade.commit()
     return trade
 
@@ -87,9 +87,9 @@ def test_protectionmanager(mocker, default_conf):
     for handler in freqtrade.protections._protection_handlers:
         assert handler.name in constants.AVAILABLE_PROTECTIONS
         if not handler.has_global_stop:
-            assert handler.global_stop(datetime.utcnow(), '*') is None
+            assert handler.global_stop(datetime.now(timezone.utc), '*') is None
         if not handler.has_local_stop:
-            assert handler.stop_per_pair('XRP/BTC', datetime.utcnow(), '*') is None
+            assert handler.stop_per_pair('XRP/BTC', datetime.now(timezone.utc), '*') is None
 
 
 @pytest.mark.parametrize('timeframe,expected,protconf', [
@@ -242,7 +242,7 @@ def test_stoploss_guard_perpair(mocker, default_conf, fee, caplog, only_per_pair
     # 2nd Trade that counts with correct pair
     generate_mock_trade(
         pair, fee.return_value, False, exit_reason=ExitType.STOP_LOSS.value,
-        min_ago_open=180, min_ago_close=30, profit_rate=0.9, is_short=is_short
+        min_ago_open=180, min_ago_close=31, profit_rate=0.9, is_short=is_short
     )
 
     freqtrade.protections.stop_per_pair(pair)
